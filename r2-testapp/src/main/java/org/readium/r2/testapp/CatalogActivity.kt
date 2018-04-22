@@ -18,6 +18,9 @@ import nl.komponents.kovenant.ui.successUi
 import org.jetbrains.anko.*
 import org.jetbrains.anko.appcompat.v7.Appcompat
 import org.jetbrains.anko.design.textInputLayout
+import org.readium.r2.lcp.LcpHttpService
+import org.readium.r2.lcp.LcpLicense
+import org.readium.r2.lcp.LcpSession
 import org.readium.r2.navigator.R2EpubActivity
 import org.readium.r2.shared.Drm
 import org.readium.r2.shared.Publication
@@ -85,6 +88,43 @@ class CatalogActivity : AppCompatActivity() {
                 val publication = pub.publication
                 if (publication.spine.size > 0) {
 
+                    pub.container.drm?.let {drm ->
+                        if (drm.brand == Drm.Brand.lcp) {
+                            //handle lcp
+
+                            handleLcpPublication(publicationPath, drm, {
+
+                                val pair = parser.parseRemainingResource(pub.container, publication, it)
+                                pub.container = pair.first
+                                pub.publication = pair.second
+
+                            }, {
+                                if (supportedProfiles.contains(it.profile)) {
+
+                                    server.addEpub(publication, pub.container, "/" + book.fileName!!)
+
+                                    Log.i(TAG, "handle lcp done")
+                                    val intent = Intent(this, R2EpubActivity::class.java)
+                                    intent.putExtra("publicationPath", publicationPath)
+                                    intent.putExtra("epubName", book.fileName)
+//                                        intent.putExtra("drm", pub.container.drm)
+                                    intent.putExtra("publication", publication)
+                                    startActivity(intent)
+
+                                } else {
+
+                                    alert(Appcompat, "The profile of this DRM is not supported.") {
+                                        negativeButton("Ok") {  }
+                                    }.show()
+
+                                }
+
+                            },{
+
+                            }).get()
+
+                        }
+                    } ?: run {
 
                         val intent = Intent(this, R2EpubActivity::class.java)
                         intent.putExtra("publicationPath", publicationPath)
@@ -92,6 +132,7 @@ class CatalogActivity : AppCompatActivity() {
                         intent.putExtra("publication", publication)
                         startActivity(intent)
 
+                    }
                 }
             }
         }
@@ -200,6 +241,52 @@ class CatalogActivity : AppCompatActivity() {
                 })
                 thread.start()
             }
+        } else if (uriString != null && lcp == true) {
+            val uri: Uri? = Uri.parse(uriString)
+            if (uri != null) {
+                val progress = indeterminateProgressDialog(getString(R.string.progress_wait_while_downloading_book))
+                progress.show()
+                val thread = Thread(Runnable {
+                    val lcpLicense = LcpLicense(URL(uri.toString()), false, this)
+                    task {
+                        lcpLicense.fetchStatusDocument().get()
+                    } then {
+                        Log.i(TAG, "LCP fetchStatusDocument: $it")
+                        lcpLicense.checkStatus()
+                        lcpLicense.updateLicenseDocument().get()
+                    } then {
+                        Log.i(TAG, "LCP updateLicenseDocument: $it")
+                        lcpLicense.areRightsValid()
+                        lcpLicense.register()
+                        lcpLicense.fetchPublication()
+                    } then {
+                        Log.i(TAG, "LCP fetchPublication: $it")
+                        it?.let {
+                            lcpLicense.moveLicense(it, lcpLicense.archivePath)
+                        }
+                        it!!
+                    } successUi {path ->
+                        val file = File(path)
+                        try {
+                            runOnUiThread(Runnable {
+                                val parser = EpubParser()
+                                val pub = parser.parse(path)
+                                if (pub != null) {
+                                    val pair = parser.parseRemainingResource(pub.container, pub.publication, pub.container.drm)
+                                    pub.container = pair.first
+                                    pub.publication = pair.second
+                                    prepareToServe(parser, pub, file.name, file.absolutePath, true)
+                                    progress.dismiss()
+
+                                }
+                            })
+                        } catch (e: Throwable) {
+                            e.printStackTrace()
+                        }
+                    }
+                })
+                thread.start()
+            }
         }
     }
 
@@ -276,8 +363,89 @@ class CatalogActivity : AppCompatActivity() {
             }
         }
 
+        pub.container.drm?.let { drm ->
+            if (drm.brand == Drm.Brand.lcp) {
+                handleLcpPublication(publicationPath, drm, {
+                    val pair = parser.parseRemainingResource(pub.container, publication, pub.container.drm)
+                    pub.container = pair.first
+                    pub.publication = pair.second
+                }, {
+                    server.addEpub(publication, container, "/" + fileName)
+                    addBookToView()
+                }, {
+
+                }).get()
+            } else {
+                server.addEpub(publication, container, "/" + fileName)
+                addBookToView()
+            }
+        } ?: run {
             server.addEpub(publication, container, "/" + fileName)
             addBookToView()
+        }
+
+    }
+
+    private fun handleLcpPublication(publicationPath: String, drm: Drm, parsingCallback:(drm:Drm) -> Unit, callback: (drm:Drm) -> Unit, callbackUI:() -> Unit): Promise<Unit, Exception> {
+
+        val lcpHttpService = LcpHttpService()
+        val session = LcpSession(publicationPath, this)
+
+        fun validatePassphrase(passphraseHash: String): Promise<LcpLicense, Exception> {
+            return task {
+                lcpHttpService.certificateRevocationList("http://crl.edrlab.telesec.de/rl/EDRLab_CA.crl").get()
+            } then { pemCrtl ->
+                session.resolve(passphraseHash, pemCrtl).get()
+            }
+        }
+
+        fun promptPassphrase(reason: String? = null, callback: (pass: String) -> Unit) {
+            runOnUiThread {
+                val hint = session.getHint()
+                alert(Appcompat, hint, reason ?: "LCP Passphrase") {
+                    var editText: EditText? = null
+                    customView {
+                        verticalLayout {
+                            textInputLayout {
+                                editText = editText { }
+                            }
+                        }
+                    }
+                    positiveButton("OK") {
+                        task {
+                            editText!!.text.toString()
+                        } then { clearPassphrase ->
+                            val passphraseHash = HASH.sha256(clearPassphrase)
+                            session.checkPassphrases(listOf(passphraseHash))
+                        } then { validPassphraseHash ->
+                            session.storePassphrase(validPassphraseHash)
+                            callback(validPassphraseHash)
+                        }
+                    }
+                    negativeButton("Cancel") { }
+                }.show()
+            }
+        }
+
+        return task {
+            val passphrases = session.passphraseFromDb()
+            passphrases?.let {
+                val lcpLicense = validatePassphrase(it).get()
+                drm.license = lcpLicense
+                drm.profile = session.getProfile()
+                parsingCallback(drm)
+                callback(drm)
+            }?: run {
+                promptPassphrase(null, {
+                    val lcpLicense = validatePassphrase(it).get()
+                    drm.license = lcpLicense
+                    drm.profile = session.getProfile()
+                    parsingCallback(drm)
+                    callback(drm)
+                    callbackUI()
+                })
+            }
+        }
 
     }
 
